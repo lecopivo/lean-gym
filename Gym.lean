@@ -29,11 +29,9 @@ Example (circular) run of `lean-gym Nat.add_comm`:
 {"goals": [], "errors": [], "branchId": 2}
 -/
 import Lean
-import Std.Data.HashMap
 
 open Lean Lean.Meta Lean.Elab Lean.Elab.Tactic
-open Std (HashMap)
-
+  
 def Lean.MessageLog.getErrorMessages (log : MessageLog) : MessageLog :=
   { msgs := log.msgs.filter fun m => match m.severity with | MessageSeverity.error => true | _ => false }
 
@@ -52,8 +50,8 @@ abbrev GymM := ReaderT Context (StateRefT State TermElabM)
 structure Problem where
   decl          : Name
   -- TODO: parse these from command-line
-  imports       : List Import   := [{ module := `Init : Import }]
-  openDecls     : List OpenDecl := []
+  imports       : List Import   := [{ module := `Lean : Import }]
+  openDecls     : List OpenDecl := [.simple `Lean []]
   currNamespace : Name          := Name.anonymous
 
 inductive Command : Type
@@ -81,18 +79,20 @@ partial def replFor (problem : Problem) : IO Unit := do
       (welcome *> repl).run context |>.run' state
 
   let termElabCtx : Term.Context := {
-    fileName := "<Gym>",
-    fileMap := { source := "", positions := #[0], lines := #[1] },
     declName? := some (problem.decl ++ "_gym_"),
     errToSorry := false
   }
+  let env ← importModules problem.imports {} 0
+
+  let coreCtx   : Core.Context := 
+    { fileName := "<Gym>",     
+      fileMap := { source := "", positions := #[0], lines := #[1] }, 
+      currNamespace := problem.currNamespace, 
+      openDecls := problem.openDecls }
+  let coreState : Core.State := { env := env }
 
   let metaM : MetaM Unit := termElabM.run' (ctx := termElabCtx)
   let coreM : CoreM Unit := metaM.run'
-
-  let env ← importModules problem.imports {} 0
-  let coreCtx   : Core.Context := { currNamespace := problem.currNamespace, openDecls := problem.openDecls }
-  let coreState : Core.State := { env := env }
 
   let ((), _) ← coreM.toIO coreCtx coreState
   pure ()
@@ -109,7 +109,7 @@ where
 
   responseForBranch (id : BranchId) : GymM Response := do
     let some savedState ← pure ((← get).branches.find? id) | throwError "invalid branch id: {id}"
-    let goals ← savedState.tactic.goals.mapM fun g => do toString (← Meta.ppGoal g)
+    let goals ← savedState.tactic.goals.mapM fun g => Meta.ppGoal g >>= pure∘toString
     pure { branchId := id, goals := goals.toArray }
 
   repl : GymM Unit := do
@@ -141,8 +141,8 @@ where
       let mvarId : MVarId := savedState.tactic.goals.head!
       try
         let unsolvedGoals ← Tactic.run mvarId tac
-        if (← getThe Term.State).messages.hasErrors then
-          let messages ← (← getThe Term.State).messages.getErrorMessages.toList.toArray
+        if (← getThe Core.State).messages.hasErrors then
+          let messages := (← getThe Core.State).messages.getErrorMessages.toList.toArray
           pure { errors := ← (messages.map Message.data).mapM fun md => md.toString }
         else
           let nextId := (← get).nextId
@@ -163,8 +163,7 @@ def parseName (n : String) : Lean.Name :=
   (n.splitOn ".").foldl Lean.Name.mkStr Lean.Name.anonymous
 
 def main (args : List String) : IO Unit := do
-  let some LEAN_PATH ← IO.getEnv "LEAN_PATH" | throw (IO.userError "LEAN_PATH not set")
-  initSearchPath LEAN_PATH
+  initSearchPath (← findSysroot)
   let [decl] ← pure args | throw (IO.userError "usage: lean-gym <decl>")
   let decl := parseName decl
   let problem : Gym.Problem := { decl := decl, currNamespace := decl.getRoot }
